@@ -1,45 +1,73 @@
-use std::env;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod config;
+
+use config::{Config, Logger};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_socks::tcp::Socks5Stream;
 
-/// Usage: shoehorn <listen_addr> <socks5_addr>
-///   e.g. shoehorn 127.0.0.1:8080 127.0.0.1:1080
+/// Reads ~/.config/shoehorn/shoehorn.conf.
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <listen_addr> <socks5_addr>", args[0]);
-        std::process::exit(1);
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let logger = match Logger::new(config.log_path.as_deref()) {
+        Ok(logger) => logger,
+        Err(e) => {
+            eprintln!("failed to initialize logger: {e}");
+            std::process::exit(1);
+        }
+    };
+    let listen_addr = config.listen_addr;
+    let socks_addr: Arc<str> = Arc::from(config.socks_addr);
+
+    let listener = TcpListener::bind(&listen_addr).await.unwrap();
+    logger.info(format!(
+        "listening on {listen_addr}, forwarding via SOCKS5 {socks_addr}"
+    ));
+    match &config.log_path {
+        Some(path) => logger.info(format!("logging to {}", path.display())),
+        None => logger.info("file logging disabled"),
     }
 
-    let listen_addr = &args[1];
-    let socks_addr: Arc<str> = Arc::from(args[2].as_str());
-
-    let listener = TcpListener::bind(listen_addr).await.unwrap();
-    eprintln!("Listening on {listen_addr}, forwarding via SOCKS5 {socks_addr}");
-
     loop {
-        let Ok((client, peer)) = listener.accept().await else { continue };
+        let Ok((client, peer)) = listener.accept().await else {
+            continue;
+        };
         let socks_addr = Arc::clone(&socks_addr);
+        let logger = logger.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(client, &socks_addr).await {
-                eprintln!("[{peer}] {e}");
+            if let Err(e) = handle(client, &socks_addr, &logger, peer).await {
+                logger.error(format!("[{peer}] {e}"));
             }
         });
     }
 }
 
-async fn handle(client: TcpStream, socks_addr: &str) -> io::Result<()> {
+async fn handle(
+    client: TcpStream,
+    socks_addr: &str,
+    logger: &Logger,
+    peer: SocketAddr,
+) -> io::Result<()> {
     let mut reader = BufReader::new(client);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
     let mut parts = request_line.trim_end().splitn(3, ' ');
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
     let target = parts.next().unwrap_or("").to_string();
+
+    if !method.is_empty() {
+        logger.info(format!("[{peer}] request method={method} target={target}"));
+    }
 
     match method.as_str() {
         "CONNECT" => handle_connect(reader, socks_addr, &target).await,
