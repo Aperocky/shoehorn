@@ -2,6 +2,9 @@
 name = "shoehorn"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP proxy that forwards traffic through a SOCKS5 server."
+license = "MIT"
+readme = "README.md"
 
 [[bin]]
 name = "shoehorn"
