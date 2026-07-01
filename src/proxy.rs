@@ -1,8 +1,12 @@
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
+
+use crate::runtime::RuntimeStats;
 
 struct RequestHead {
     method: String,
@@ -29,6 +33,26 @@ pub struct ProxyOutcome {
     pub error: Option<io::Error>,
 }
 
+struct ConnectOutcome {
+    transfer: TransferStats,
+    error: Option<io::Error>,
+}
+
+#[derive(Default)]
+struct TransferCounters {
+    client_to_upstream: AtomicU64,
+    upstream_to_client: AtomicU64,
+}
+
+impl TransferCounters {
+    fn snapshot(&self) -> TransferStats {
+        TransferStats {
+            client_to_upstream: self.client_to_upstream.load(Ordering::Relaxed),
+            upstream_to_client: self.upstream_to_client.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl TransferStats {
     fn add(&mut self, other: Self) {
         self.client_to_upstream += other.client_to_upstream;
@@ -36,7 +60,12 @@ impl TransferStats {
     }
 }
 
-pub async fn handle<F>(client: TcpStream, socks_addr: &str, on_target: F) -> ProxyOutcome
+pub async fn handle<F>(
+    client: TcpStream,
+    socks_addr: &str,
+    stats: &RuntimeStats,
+    on_target: F,
+) -> ProxyOutcome
 where
     F: FnOnce(&str),
 {
@@ -70,15 +99,12 @@ where
         }
 
         if head.method == "CONNECT" {
-            let result = handle_connect(reader, socks_addr, &head.target).await;
-            let transfer = result.as_ref().ok().copied();
-            if let Some(transfer) = transfer {
-                transfers.add(transfer);
-            }
+            let outcome = handle_connect(reader, socks_addr, &head.target, stats).await;
+            transfers.add(outcome.transfer);
             return ProxyOutcome {
                 target,
                 transfer: transfers,
-                error: result.err(),
+                error: outcome.error,
             };
         }
 
@@ -107,37 +133,134 @@ async fn handle_connect(
     reader: BufReader<TcpStream>,
     socks_addr: &str,
     target: &str,
-) -> io::Result<TransferStats> {
+    stats: &RuntimeStats,
+) -> ConnectOutcome {
     let pending = reader.buffer().to_vec();
     let mut client = reader.into_inner();
     let upstream = match Socks5Stream::connect(socks_addr, target).await {
         Ok(s) => s,
         Err(e) => {
-            client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await?;
-            return Err(io::Error::other(format!(
-                "SOCKS5 connect to {target} failed: {e}"
-            )));
+            if let Err(write_error) = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await {
+                return ConnectOutcome {
+                    transfer: TransferStats::default(),
+                    error: Some(write_error),
+                };
+            }
+
+            return ConnectOutcome {
+                transfer: TransferStats::default(),
+                error: Some(io::Error::other(format!(
+                    "SOCKS5 connect to {target} failed: {e}"
+                ))),
+            };
         }
     };
 
-    client
+    if let Err(error) = client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
+        .await
+    {
+        return ConnectOutcome {
+            transfer: TransferStats::default(),
+            error: Some(error),
+        };
+    }
 
     let mut upstream = upstream.into_inner();
     if !pending.is_empty() {
-        upstream.write_all(&pending).await?;
+        if let Err(error) = upstream.write_all(&pending).await {
+            return ConnectOutcome {
+                transfer: TransferStats::default(),
+                error: Some(error),
+            };
+        }
+        stats.add_tx_bytes(pending.len() as u64);
     }
 
-    let (client_to_upstream, upstream_to_client) =
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    let counters = Arc::new(TransferCounters::default());
+    counters
+        .client_to_upstream
+        .store(pending.len() as u64, Ordering::Relaxed);
 
-    Ok(TransferStats {
-        client_to_upstream: client_to_upstream + pending.len() as u64,
-        upstream_to_client,
-    })
+    let result = copy_bidirectional_counted(&mut client, &mut upstream, stats, &counters).await;
+
+    ConnectOutcome {
+        transfer: counters.snapshot(),
+        error: result.err(),
+    }
+}
+
+async fn copy_bidirectional_counted(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    stats: &RuntimeStats,
+    counters: &Arc<TransferCounters>,
+) -> io::Result<()> {
+    let (mut client_read, mut client_write) = client.split();
+    let (mut upstream_read, mut upstream_write) = upstream.split();
+
+    let client_to_upstream = copy_counted(
+        &mut client_read,
+        &mut upstream_write,
+        stats,
+        counters,
+        Direction::ClientToUpstream,
+    );
+    let upstream_to_client = copy_counted(
+        &mut upstream_read,
+        &mut client_write,
+        stats,
+        counters,
+        Direction::UpstreamToClient,
+    );
+
+    tokio::try_join!(client_to_upstream, upstream_to_client)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    ClientToUpstream,
+    UpstreamToClient,
+}
+
+async fn copy_counted<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    stats: &RuntimeStats,
+    counters: &TransferCounters,
+    direction: Direction,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+
+        writer.write_all(&buffer[..read]).await?;
+        let read = read as u64;
+        match direction {
+            Direction::ClientToUpstream => {
+                counters
+                    .client_to_upstream
+                    .fetch_add(read, Ordering::Relaxed);
+                stats.add_tx_bytes(read);
+            }
+            Direction::UpstreamToClient => {
+                counters
+                    .upstream_to_client
+                    .fetch_add(read, Ordering::Relaxed);
+                stats.add_rx_bytes(read);
+            }
+        }
+    }
 }
 
 async fn handle_http(

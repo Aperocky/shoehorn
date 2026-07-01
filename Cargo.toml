@@ -1,6 +1,6 @@
 [package]
 name = "shoehorn"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "HTTP proxy that forwards traffic through a SOCKS5 server."
 license = "MIT"
@@ -11,5 +11,5 @@ name = "shoehorn"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.52", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 tokio-socks = "0.5.2"

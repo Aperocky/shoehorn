@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod config;
 mod proxy;
@@ -38,11 +38,32 @@ async fn main() {
         Some(path) => logger.info(format!("logging to {}", path.display())),
         None => logger.info("file logging disabled"),
     }
+    let mut traffic_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(300),
+        Duration::from_secs(300),
+    );
 
     loop {
-        let Ok((client, peer)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = traffic_interval.tick() => {
+                let snapshot = stats.snapshot();
+                if snapshot.active_tasks > 0 {
+                    logger.info(format!(
+                        "traffic active_tasks={} total_tx_bytes={} total_rx_bytes={} total_bytes={}",
+                        snapshot.active_tasks,
+                        snapshot.tx_bytes,
+                        snapshot.rx_bytes,
+                        snapshot.tx_bytes + snapshot.rx_bytes
+                    ));
+                }
+                continue;
+            }
+        };
+        let Ok((client, peer)) = accepted else {
             continue;
         };
+
         let socks_addr = Arc::clone(&socks_addr);
         let logger = logger.clone();
         let stats = Arc::clone(&stats);
@@ -53,7 +74,7 @@ async fn main() {
             let task_id = task.id;
             let active_tasks = task.active;
 
-            let outcome = proxy::handle(client, &socks_addr, move |target| {
+            let outcome = proxy::handle(client, &socks_addr, stats.as_ref(), move |target| {
                 start_logger.info(format!(
                     "[task={task_id}] [{peer}] task start target={target} active_tasks={active_tasks}"
                 ));
