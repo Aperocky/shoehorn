@@ -1,6 +1,6 @@
 # shoehorn
 
-HTTP proxy that forwards traffic through a SOCKS5 server.
+Tiny HTTP proxy that forwards traffic through a SOCKS5 server.
 
 ## Install
 
@@ -13,8 +13,7 @@ cargo install shoehorn
 Create `~/.config/shoehorn/shoehorn.conf`:
 
 ```ini
-listen_addr=127.0.0.1:8080
-socks_addr=127.0.0.1:1080
+listen_addr=127.0.0.1:8080 socks_addr=127.0.0.1:1080
 log_path=/tmp/shoehorn.log
 ```
 
