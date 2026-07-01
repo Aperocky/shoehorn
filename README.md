@@ -25,3 +25,13 @@ log_path=/tmp/shoehorn.log
 ```sh
 shoehorn
 ```
+
+## Logging
+
+Each accepted client connection gets a strictly increasing `task=N` identifier.
+Task lifecycle lines include `target` and `active_tasks`. Completed tasks also
+log `elapsed_ms`, `tx_bytes`, and `rx_bytes` on task end lines.
+
+`CONNECT` requests are tunnels, so one spawned task owns one tunnel until it
+closes. Requests for different HTTPS origins cannot share that task at the proxy
+protocol layer.
